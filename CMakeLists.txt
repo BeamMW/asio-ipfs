@@ -13,7 +13,6 @@ include(ExternalProject)
 set(BOOST_VERSION 1.62)
 find_package(Boost ${BOOST_VERSION} REQUIRED COMPONENTS
     coroutine
-    system
 )
 
 #

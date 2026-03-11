@@ -8,6 +8,7 @@ typedef size_t __SIZE_TYPE__;
 
 #include <cassert>
 #include <tuple>
+#include <boost/asio/post.hpp>
 #include <boost/intrusive/list.hpp>
 #include <boost/optional.hpp>
 #include <nlohmann/json.hpp>
@@ -30,7 +31,7 @@ struct HandleBase : public intr::list_base_hook
 };
 
 struct asio_ipfs::node_impl {
-    asio::io_service& ios;
+    asio::io_context& ios;
     intr::list<HandleBase, intr::constant_time_size<false>> handles;
 
     asio_ipfs::node::StateCB scb;
@@ -39,7 +40,7 @@ struct asio_ipfs::node_impl {
         reinterpret_cast<node_impl*>(self)->scb(serr, peercnt);
     }
 
-    explicit node_impl(asio::io_service& ios, asio_ipfs::node::StateCB scb)
+    explicit node_impl(asio::io_context& ios, asio_ipfs::node::StateCB scb)
         : ios(ios)
         , scb(move(scb))
     {
@@ -48,12 +49,12 @@ struct asio_ipfs::node_impl {
 
 template<class... As>
 struct Handle : public HandleBase {
-    asio::io_service& ios;
+    asio::io_context& ios;
     function<void(sys::error_code, As&&...)> cb;
     function<void()>* cancel_fn;
     function<void()> destructor_cancel_fn;
     boost::optional<uint64_t> cancel_signal_id;
-    asio::io_service::work work;
+    boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work;
     unsigned job_count = 1;
 
     Handle( node_impl* impl
@@ -63,7 +64,7 @@ struct Handle : public HandleBase {
         : ios(impl->ios)
         , cancel_fn(cancel_fn_ ? cancel_fn_ : &destructor_cancel_fn)
         , cancel_signal_id(cancel_signal_id_)
-        , work(asio::io_service::work(ios))
+        , work(boost::asio::make_work_guard(ios))
     {
         impl->handles.push_back(*this);
 
@@ -98,7 +99,7 @@ struct Handle : public HandleBase {
                 std::apply(callback, std::move(args));
             };
 
-            this->ios.post(postcb);
+            boost::asio::post(this->ios, postcb);
             (*cancel_fn) = []{};
         };
 
@@ -113,7 +114,7 @@ struct Handle : public HandleBase {
      */
     static void call(int32_t err, void* arg, As... args) {
         auto self = reinterpret_cast<Handle*>(arg);
-        self->ios.post([
+        boost::asio::post(self->ios, [
             self,
             full_args = make_tuple(make_error_code(error::ipfs_error{err}), std::move(args)...)
         ] {
@@ -238,7 +239,7 @@ void node::redirect_logs(LogCB logcb)
     }
 }
 
-node::node(asio::io_service& ios, StateCB scb, config cfg)
+node::node(asio::io_context& ios, StateCB scb, config cfg)
 {
     string cfg_s = config_to_json(cfg);
     _impl = make_unique<node_impl>(ios, move(scb));
@@ -286,7 +287,7 @@ node::~node()
     }
 }
 
-void node::build_( asio::io_service& ios
+void node::build_( asio::io_context& ios
                  , StateCB scb
                  , config cfg
                  , Cancel* cancel
@@ -391,7 +392,7 @@ void node::gc_(Cancel* cancel, std::function<void(boost::system::error_code)> cb
     call_ipfs(_impl.get(), cancel, std::move(cb), go_asio_ipfs_gc);
 }
 
-boost::asio::io_service& node::get_io_service()
+boost::asio::io_context& node::get_io_service()
 {
     return _impl->ios;
 }

@@ -3,11 +3,21 @@
 #include <functional>
 #include <memory>
 #include <boost/asio/steady_timer.hpp>
-#include <boost/asio/io_service.hpp>
+#include <boost/asio/io_context.hpp>
 #include <boost/utility/string_view.hpp>
 #include "ipfs_config.h"
 
 namespace asio_ipfs {
+
+    // Wraps a move-only completion handler in a shared_ptr so the resulting
+    // callable satisfies CopyConstructible, as required by std::function.
+    // Needed because boost::asio::detail::spawn_handler is move-only (Boost >=1.88 / MSVC 14.44).
+    template<class H>
+    auto make_copyable_handler(H&& h) {
+        auto sp = std::make_shared<std::decay_t<H>>(std::forward<H>(h));
+        return [sp](auto&&... args) mutable { (*sp)(std::forward<decltype(args)>(args)...); };
+    }
+
     struct node_impl;
     class node {
         using Timer = boost::asio::steady_timer;
@@ -15,9 +25,6 @@ namespace asio_ipfs {
 
         template<class Token, class... Ret>
         using Result = typename boost::asio::async_result<std::decay_t<Token>, void(boost::system::error_code, Ret...)>;
-
-        template<class Token, class... Ret>
-        using Handler = typename boost::asio::async_result<std::decay_t<Token>, void(boost::system::error_code, Ret...)>::completion_handler_type;
 
         using string_view = boost::string_view;
 
@@ -33,7 +40,7 @@ namespace asio_ipfs {
         // This constructor may do repository initialization disk IO and as such
         // may block for a second or more. If that is undesired, use the static
         // async `node::build` function instead.
-        node(boost::asio::io_service&, StateCB, config);
+        node(boost::asio::io_context&, StateCB, config);
 
         node(node&&) noexcept;
         node& operator=(node&&) noexcept;
@@ -41,17 +48,17 @@ namespace asio_ipfs {
         node(const node&) = delete;
         node& operator=(const node&) = delete;
 
-        boost::asio::io_service& get_io_service();
+        boost::asio::io_context& get_io_service();
         void free();
         ~node();
 
         template<class Token>
         static typename Result<Token, std::unique_ptr<node>>::return_type
-        build(boost::asio::io_service&, StateCB, config, Token&&);
+        build(boost::asio::io_context&, StateCB, config, Token&&);
 
         template<class Token>
         static typename Result<Token, std::unique_ptr<node>>::return_type
-        build(boost::asio::io_service&, StateCB, config, Cancel&, Token&&);
+        build(boost::asio::io_context&, StateCB, config, Cancel&, Token&&);
 
         // Returns this node's IPFS ID
         [[nodiscard]] std::string id() const;
@@ -110,7 +117,7 @@ namespace asio_ipfs {
         void gc(Cancel&, Token&&);
 
     private:
-        static void build_(boost::asio::io_service&, StateCB, config, Cancel*,
+        static void build_(boost::asio::io_context&, StateCB, config, Cancel*,
                            std::function<void( const boost::system::error_code&, std::unique_ptr<node>)>);
         void add_(const uint8_t* data, size_t size, bool pin, Cancel*, std::function<void(boost::system::error_code, std::string)>&&);
         void calc_cid_(const uint8_t* data, size_t size, Cancel*, std::function<void(boost::system::error_code, std::string)>&&);
@@ -128,173 +135,207 @@ namespace asio_ipfs {
 
     template<class Token>
     inline typename node::Result<Token, std::unique_ptr<node>>::return_type
-    node::build( boost::asio::io_service& ios
+    node::build( boost::asio::io_context& ios
                , StateCB scb
                , config cfg
                , Token&& token)
     {
         using BackendP = std::unique_ptr<node>;
-        Handler<Token, BackendP> handler(std::forward<Token>(token));
-        Result<Token, BackendP> result(handler);
-        build_(ios, move(scb), cfg, nullptr, std::move(handler));
-        return result.get();
+        return boost::asio::async_initiate<Token, void(boost::system::error_code, BackendP)>(
+            [&ios, scb=std::move(scb), cfg](auto handler) mutable {
+                build_(ios, std::move(scb), cfg, nullptr, make_copyable_handler(std::move(handler)));
+            },
+            token
+        );
     }
 
     template<class Token>
     inline typename node::Result<Token, std::unique_ptr<node>>::return_type
-    node::build( boost::asio::io_service& ios
+    node::build( boost::asio::io_context& ios
                , StateCB scb
                , config cfg
                , Cancel& cancel
                , Token&& token)
     {
         using BackendP = std::unique_ptr<node>;
-        Handler<Token, BackendP> handler(std::forward<Token>(token));
-        Result<Token, BackendP> result(handler);
-        build_(ios, move(scb), cfg, &cancel, std::move(handler));
-        return result.get();
+        return boost::asio::async_initiate<Token, void(boost::system::error_code, BackendP)>(
+            [&ios, &cancel, scb=std::move(scb), cfg](auto handler) mutable {
+                build_(ios, std::move(scb), cfg, &cancel, make_copyable_handler(std::move(handler)));
+            },
+            token
+        );
     }
 
     template<class Token>
     inline typename node::Result<Token, std::string>::return_type
     node::add(const uint8_t* data, size_t size, bool pin, Token&& token)
     {
-        Handler<Token, std::string> handler(std::forward<Token>(token));
-        Result<Token, std::string> result(handler);
-        add_(data, size, pin, nullptr, std::move(handler));
-        return result.get();
+        return boost::asio::async_initiate<Token, void(boost::system::error_code, std::string)>(
+            [this, data, size, pin](auto handler) mutable {
+                add_(data, size, pin, nullptr, make_copyable_handler(std::move(handler)));
+            },
+            token
+        );
     }
 
     template<class Token>
     inline typename node::Result<Token, std::string>::return_type
     node::add(const uint8_t* data, size_t size, bool pin, Cancel& cancel, Token&& token)
     {
-        Handler<Token, std::string> handler(std::forward<Token>(token));
-        Result<Token, std::string> result(handler);
-        add_(data, size, pin, &cancel, std::move(handler));
-        return result.get();
+        return boost::asio::async_initiate<Token, void(boost::system::error_code, std::string)>(
+            [this, data, size, pin, &cancel](auto handler) mutable {
+                add_(data, size, pin, &cancel, make_copyable_handler(std::move(handler)));
+            },
+            token
+        );
     }
 
     template<class Token>
     inline typename node::Result<Token, std::string>::return_type
     node::calc_cid(const uint8_t* data, size_t size, Token&& token)
     {
-        Handler<Token, std::string> handler(std::forward<Token>(token));
-        Result<Token, std::string> result(handler);
-        calc_cid_(data, size, nullptr, std::move(handler));
-        return result.get();
+        return boost::asio::async_initiate<Token, void(boost::system::error_code, std::string)>(
+            [this, data, size](auto handler) mutable {
+                calc_cid_(data, size, nullptr, make_copyable_handler(std::move(handler)));
+            },
+            token
+        );
     }
 
     template<class Token>
     inline typename node::Result<Token, std::string>::return_type
     node::calc_cid(const uint8_t* data, size_t size, Cancel& cancel, Token&& token)
     {
-        Handler<Token, std::string> handler(std::forward<Token>(token));
-        Result<Token, std::string> result(handler);
-        calc_cid_(data, size, &cancel, std::move(handler));
-        return result.get();
+        return boost::asio::async_initiate<Token, void(boost::system::error_code, std::string)>(
+            [this, data, size, &cancel](auto handler) mutable {
+                calc_cid_(data, size, &cancel, make_copyable_handler(std::move(handler)));
+            },
+            token
+        );
     }
 
     template<class Token>
     inline typename node::Result<Token, std::vector<uint8_t>>::return_type
     node::cat(const std::string& cid, Token&& token)
     {
-        Handler<Token, std::vector<uint8_t>> handler(std::forward<Token>(token));
-        Result<Token, std::vector<uint8_t>> result(handler);
-        cat_(cid, nullptr, std::move(handler));
-        return result.get();
+        return boost::asio::async_initiate<Token, void(boost::system::error_code, std::vector<uint8_t>)>(
+            [this, cid](auto handler) mutable {
+                cat_(cid, nullptr, make_copyable_handler(std::move(handler)));
+            },
+            token
+        );
     }
 
     template<class Token>
     inline typename node::Result<Token, std::vector<uint8_t>>::return_type
     node::cat(const std::string& cid, Cancel& cancel, Token&& token)
     {
-        Handler<Token, std::vector<uint8_t>> handler(std::forward<Token>(token));
-        Result<Token, std::vector<uint8_t>> result(handler);
-        cat_(cid, &cancel, std::move(handler));
-        return result.get();
+        return boost::asio::async_initiate<Token, void(boost::system::error_code, std::vector<uint8_t>)>(
+            [this, cid, &cancel](auto handler) mutable {
+                cat_(cid, &cancel, make_copyable_handler(std::move(handler)));
+            },
+            token
+        );
     }
 
     template<class Token>
     inline void node::publish(const std::string& cid, Timer::duration d, Token&& token)
     {
-        Handler<Token> handler(std::forward<Token>(token));
-        Result<Token> result(handler);
-        publish_(cid, d, nullptr, std::move(handler));
-        return result.get();
+        boost::asio::async_initiate<Token, void(boost::system::error_code)>(
+            [this, cid, d](auto handler) mutable {
+                publish_(cid, d, nullptr, make_copyable_handler(std::move(handler)));
+            },
+            token
+        );
     }
 
     template<class Token>
     inline void node::publish(const std::string& cid, Timer::duration d, Cancel& cancel, Token&& token)
     {
-        Handler<Token> handler(std::forward<Token>(token));
-        Result<Token> result(handler);
-        publish_(cid, d, &cancel, std::move(handler));
-        return result.get();
+        boost::asio::async_initiate<Token, void(boost::system::error_code)>(
+            [this, cid, d, &cancel](auto handler) mutable {
+                publish_(cid, d, &cancel, make_copyable_handler(std::move(handler)));
+            },
+            token
+        );
     }
 
     template<class Token>
     inline typename node::Result<Token, std::string>::return_type
     node::resolve(const std::string& ipns_id, Token&& token)
     {
-        Handler<Token, std::string> handler(std::forward<Token>(token));
-        Result<Token, std::string> result(handler);
-        resolve_(ipns_id, nullptr, std::move(handler));
-        return result.get();
+        return boost::asio::async_initiate<Token, void(boost::system::error_code, std::string)>(
+            [this, ipns_id](auto handler) mutable {
+                resolve_(ipns_id, nullptr, make_copyable_handler(std::move(handler)));
+            },
+            token
+        );
     }
 
     template<class Token>
     inline typename node::Result<Token, std::string>::return_type
     node::resolve(const std::string& ipns_id, Cancel& cancel, Token&& token)
     {
-        Handler<Token, std::string> handler(std::forward<Token>(token));
-        Result<Token, std::string> result(handler);
-        resolve_(ipns_id, &cancel, std::move(handler));
-        return result.get();
+        return boost::asio::async_initiate<Token, void(boost::system::error_code, std::string)>(
+            [this, ipns_id, &cancel](auto handler) mutable {
+                resolve_(ipns_id, &cancel, make_copyable_handler(std::move(handler)));
+            },
+            token
+        );
     }
 
     template<class Token>
     inline void node::pin(const std::string& cid, Token&& token)
     {
-        Handler<Token> handler(std::forward<Token>(token));
-        Result<Token> result(handler);
-        pin_(cid, nullptr, std::move(handler));
-        return result.get();
+        boost::asio::async_initiate<Token, void(boost::system::error_code)>(
+            [this, cid](auto handler) mutable {
+                pin_(cid, nullptr, make_copyable_handler(std::move(handler)));
+            },
+            token
+        );
     }
 
     template<class Token>
     inline void node::pin(const std::string& cid, Cancel& cancel, Token&& token)
     {
-        Handler<Token> handler(std::forward<Token>(token));
-        Result<Token> result(handler);
-        pin_(cid, &cancel, std::move(handler));
-        return result.get();
+        boost::asio::async_initiate<Token, void(boost::system::error_code)>(
+            [this, cid, &cancel](auto handler) mutable {
+                pin_(cid, &cancel, make_copyable_handler(std::move(handler)));
+            },
+            token
+        );
     }
 
     template<class Token>
     inline void node::unpin(const std::string& cid, Token&& token)
     {
-        Handler<Token> handler(std::forward<Token>(token));
-        Result<Token> result(handler);
-        unpin_(cid, nullptr, std::move(handler));
-        return result.get();
+        boost::asio::async_initiate<Token, void(boost::system::error_code)>(
+            [this, cid](auto handler) mutable {
+                unpin_(cid, nullptr, make_copyable_handler(std::move(handler)));
+            },
+            token
+        );
     }
 
     template<class Token>
     inline void node::unpin(const std::string& cid, Cancel& cancel, Token&& token)
     {
-        Handler<Token> handler(std::forward<Token>(token));
-        Result<Token> result(handler);
-        unpin_(cid, &cancel, std::move(handler));
-        return result.get();
+        boost::asio::async_initiate<Token, void(boost::system::error_code)>(
+            [this, cid, &cancel](auto handler) mutable {
+                unpin_(cid, &cancel, make_copyable_handler(std::move(handler)));
+            },
+            token
+        );
     }
 
     template<class Token>
     inline void node::gc(Cancel& cancel, Token&& token)
     {
-        Handler<Token> handler(std::forward<Token>(token));
-        Result<Token> result(handler);
-        gc_(&cancel, std::move(handler));
-        return result.get();
+        boost::asio::async_initiate<Token, void(boost::system::error_code)>(
+            [this, &cancel](auto handler) mutable {
+                gc_(&cancel, make_copyable_handler(std::move(handler)));
+            },
+            token
+        );
     }
 }
