@@ -132,3 +132,57 @@ After the previous steps you can use a CMake toolchain file like the following o
 
     set(BOOST_INCLUDEDIR /path/to/Boost-for-Android/build/boost/<BOOST_VERSION>/include)
     set(BOOST_LIBRARYDIR /path/to/Boost-for-Android/build/boost/<BOOST_VERSION>/libs/${CMAKE_ANDROID_ARCH_ABI}/llvm-3.5)
+
+### iOS cross-compilation
+
+iOS builds run on a macOS host and cross-compile via Xcode's `iphoneos`
+and `iphonesimulator` SDKs. CMake's built-in iOS toolchain is used — no
+external toolchain file required — driven by `CMAKE_SYSTEM_NAME=iOS`,
+`CMAKE_OSX_SYSROOT`, and `CMAKE_OSX_ARCHITECTURES`.
+
+Prereqs:
+
+  - macOS with Xcode + Command Line Tools installed (`xcode-select --install`)
+  - CMake 3.13 or newer
+  - Boost built against the iOS SDK. The C++ wrapper only consumes
+    header-only Boost (asio / intrusive / optional / system), so a
+    headers-only tree is enough. The Apple-Boost-BuildScript
+    ([faithfracture/Apple-Boost-BuildScript](https://github.com/faithfracture/Apple-Boost-BuildScript))
+    works; Beam's iOS wallet uses the same convention via the
+    `BOOST_ROOT_IOS` environment variable.
+
+One slice per `(sdk, arch)` invocation — CMake's iOS toolchain rejects
+multi-arch CMAKE_OSX_ARCHITECTURES, so device, simulator-arm64 and
+simulator-x86_64 are configured separately and combined into an
+XCFramework at the end.
+
+Drive everything via the bundled script:
+
+    BOOST_ROOT_IOS=/path/to/boost ./scripts/build-ios.sh
+
+That builds all three slices into `build/ios/<slice>/` and produces
+`ipfs-bindings.xcframework` + `asio-ipfs.xcframework` you can drop into
+an Xcode target (or into Beam's iOS `Frameworks/` tree alongside the
+existing `boost.framework` / `openssl.framework`).
+
+Build a single slice:
+
+    BOOST_ROOT_IOS=/path/to/boost ./scripts/build-ios.sh device-arm64
+
+Or configure manually:
+
+    cmake -S . -B build/ios/device-arm64 \
+        -DCMAKE_SYSTEM_NAME=iOS \
+        -DCMAKE_OSX_SYSROOT=iphoneos \
+        -DCMAKE_OSX_ARCHITECTURES=arm64 \
+        -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
+        -DBOOST_ROOT=/path/to/boost
+    cmake --build build/ios/device-arm64
+
+The CMake configure step shells out to `xcrun` to resolve the SDK path
+and clang binary, then bakes them into a single `CC=<clang> -target
+<triple> -isysroot <sdk>` string that Go's cgo uses as the C
+toolchain. The Go toolchain itself is the unmodified Go 1.16.10
+darwin tarball that's already downloaded by this repo — Go's cross
+compile is driven entirely by `GOOS=ios` + `GOARCH` + `CC`, no extra
+Go SDK is required.
