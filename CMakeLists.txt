@@ -381,7 +381,14 @@ elseif (IOS)
             "Install Xcode and run xcode-select --install before configuring.")
     endif()
 
-    set(IOS_CC "${IOS_CLANG_BIN} -target ${IOS_CLANG_TARGET} -isysroot ${IOS_SDK_PATH}")
+    # Go's cgo composes its own compile commands for std-library cgo glue
+    # (net, os/user, plugin, ...). When `CC` is a single string with embedded
+    # flags, Go only uses the first token as the program and silently drops
+    # the rest for those internal compiles, which is why CI hit fatal errors
+    # on `<unistd.h>`, `<netdb.h>`, `<dlfcn.h>` even though our CC carried
+    # `-isysroot`. CGO_CFLAGS / CGO_LDFLAGS are appended verbatim to every
+    # cgo invocation, so the iOS target + sysroot have to ride there.
+    set(IOS_CGO_FLAGS "-target ${IOS_CLANG_TARGET} -isysroot ${IOS_SDK_PATH}")
 
     add_custom_command(
         OUTPUT  ${BINDINGS_OUTPUT}
@@ -404,8 +411,11 @@ elseif (IOS)
                     "GOARCH=${GOARCH}"
                     "CGO_ENABLED=1"
                     "GO111MODULE=on"
-                    "CC=${IOS_CC}"
-                    "CXX=${IOS_CC}"
+                    "CC=${IOS_CLANG_BIN}"
+                    "CXX=${IOS_CLANG_BIN}"
+                    "CGO_CFLAGS=${IOS_CGO_FLAGS}"
+                    "CGO_CXXFLAGS=${IOS_CGO_FLAGS}"
+                    "CGO_LDFLAGS=${IOS_CGO_FLAGS}"
                     ${GOROOT}/bin/go build
                         --buildmode=c-archive
                         -ldflags "-s -w"
