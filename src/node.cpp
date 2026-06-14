@@ -347,6 +347,12 @@ void node::resolve_( const string& node_id
     call_ipfs(_impl.get(), cancel, std::move(cb), go_asio_ipfs_resolve, (char*) node_id.data());
 }
 
+void node::swarm_peers_( Cancel* cancel
+                       , function<void(sys::error_code, string)> cb)
+{
+    call_ipfs(_impl.get(), cancel, std::move(cb), go_asio_ipfs_swarm_peers);
+}
+
 void node::add_( const uint8_t* data
                , size_t size
                , bool pin
