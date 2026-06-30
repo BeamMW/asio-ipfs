@@ -102,6 +102,14 @@ namespace asio_ipfs {
         resolve(const std::string& ipns_id, Cancel&, Token&&);
 
         template<class Token>
+        typename Result<Token, std::string>::return_type
+        swarm_peers(Token&&);
+
+        template<class Token>
+        typename Result<Token, std::string>::return_type
+        swarm_peers(Cancel&, Token&&);
+
+        template<class Token>
         void pin(const std::string& cid, Token&&);
 
         template<class Token>
@@ -124,6 +132,7 @@ namespace asio_ipfs {
         void cat_(const std::string& cid, Cancel*, std::function<void(boost::system::error_code, std::vector<uint8_t>)>);
         void publish_(const std::string& cid, Timer::duration, Cancel*, std::function<void(boost::system::error_code)>);
         void resolve_(const std::string& ipns_id, Cancel*, std::function<void(boost::system::error_code, std::string)>);
+        void swarm_peers_(Cancel*, std::function<void(boost::system::error_code, std::string)>);
         void pin_(const std::string& cid, Cancel*, std::function<void(boost::system::error_code)>);
         void unpin_(const std::string& cid, Cancel*, std::function<void(boost::system::error_code)>);
         void gc_(Cancel*, std::function<void(boost::system::error_code)>);
@@ -279,6 +288,30 @@ namespace asio_ipfs {
         return boost::asio::async_initiate<Token, void(boost::system::error_code, std::string)>(
             [this, ipns_id, &cancel](auto handler) mutable {
                 resolve_(ipns_id, &cancel, make_copyable_handler(std::move(handler)));
+            },
+            token
+        );
+    }
+
+    template<class Token>
+    inline typename node::Result<Token, std::string>::return_type
+    node::swarm_peers(Token&& token)
+    {
+        return boost::asio::async_initiate<Token, void(boost::system::error_code, std::string)>(
+            [this](auto handler) mutable {
+                swarm_peers_(nullptr, make_copyable_handler(std::move(handler)));
+            },
+            token
+        );
+    }
+
+    template<class Token>
+    inline typename node::Result<Token, std::string>::return_type
+    node::swarm_peers(Cancel& cancel, Token&& token)
+    {
+        return boost::asio::async_initiate<Token, void(boost::system::error_code, std::string)>(
+            [this, &cancel](auto handler) mutable {
+                swarm_peers_(&cancel, make_copyable_handler(std::move(handler)));
             },
             token
         );

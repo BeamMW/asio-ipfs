@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"log"
 	"context"
 	"unsafe"
@@ -283,6 +284,63 @@ func go_asio_ipfs_cat(cancel_signal C.uint64_t, c_cid *C.char, fn unsafe.Pointer
 		defer C.free(cdata)
 
 		C.execute_data_cb(fn, C.IPFS_SUCCESS, cdata, C.size_t(len(bytes)), fn_arg)
+	}()
+}
+
+//export go_asio_ipfs_swarm_peers
+func go_asio_ipfs_swarm_peers(cancel_signal C.uint64_t, fn unsafe.Pointer, fn_arg unsafe.Pointer) {
+	var n = g_node
+	if n == nil {
+		go func() {
+			C.execute_data_cb(fn, C.IPFS_NO_NODE, nil, C.size_t(0), fn_arg)
+		}()
+		return
+	}
+
+	cancel_ctx := withCancel(n, cancel_signal)
+
+	go func() {
+		// Best-effort: any failure → empty array, still IPFS_SUCCESS.
+		type peerJSON struct {
+			ID        string `json:"id"`
+			Addr      string `json:"addr"`
+			Direction string `json:"direction"`
+			LatencyMs uint32 `json:"latencyMs"`
+		}
+		out := make([]peerJSON, 0)
+
+		conns, err := n.api.Swarm().Peers(cancel_ctx)
+		if err != nil {
+			log.Printf("go_asio_ipfs_swarm_peers: Swarm().Peers failed: %v\n", err)
+		} else {
+			for _, ci := range conns {
+				dir := "unknown"
+				switch ci.Direction().String() {
+				case "Inbound":
+					dir = "inbound"
+				case "Outbound":
+					dir = "outbound"
+				}
+				var ms uint32
+				if lat, lerr := ci.Latency(); lerr == nil && lat > 0 {
+					ms = uint32(lat / time.Millisecond)
+				}
+				out = append(out, peerJSON{
+					ID:        ci.ID().Pretty(),
+					Addr:      ci.Address().String(),
+					Direction: dir,
+					LatencyMs: ms,
+				})
+			}
+		}
+
+		data, jerr := json.Marshal(out)
+		if jerr != nil {
+			data = []byte("[]")
+		}
+		cdata := C.CBytes(data)
+		defer C.free(cdata)
+		C.execute_data_cb(fn, C.IPFS_SUCCESS, cdata, C.size_t(len(data)), fn_arg)
 	}()
 }
 
