@@ -11,18 +11,46 @@ include(ExternalProject)
 # Boost
 #
 set(BOOST_VERSION 1.62)
-find_package(Boost ${BOOST_VERSION} REQUIRED COMPONENTS
-    coroutine
-)
+if ("${CMAKE_SYSTEM_NAME}" STREQUAL "iOS")
+    # iOS Boost is typically distributed as a fat framework or a header
+    # tree + a single combined static library, not as the per-component
+    # libs that `find_package(... COMPONENTS coroutine)` expects. The
+    # asio-ipfs C++ wrapper only uses header-only parts (asio, intrusive,
+    # optional) plus boost::system, so we point the build straight at
+    # the headers via BOOST_ROOT / BOOST_ROOT_IOS (the convention Beam's
+    # iOS wallet already uses) and skip find_package entirely.
+    if (DEFINED ENV{BOOST_ROOT_IOS} AND NOT BOOST_ROOT)
+        set(BOOST_ROOT "$ENV{BOOST_ROOT_IOS}")
+    endif()
+    if (BOOST_ROOT AND NOT Boost_INCLUDE_DIR)
+        if (EXISTS "${BOOST_ROOT}/include")
+            set(Boost_INCLUDE_DIR "${BOOST_ROOT}/include")
+        elseif (EXISTS "${BOOST_ROOT}/boost.framework/Headers")
+            set(Boost_INCLUDE_DIR "${BOOST_ROOT}/boost.framework/Headers")
+        else()
+            set(Boost_INCLUDE_DIR "${BOOST_ROOT}")
+        endif()
+    endif()
+    if (NOT Boost_INCLUDE_DIR)
+        message(FATAL_ERROR
+            "iOS build: Boost headers not found. Pass BOOST_ROOT (or set "
+            "the BOOST_ROOT_IOS env var) pointing at an iOS Boost tree.")
+    endif()
+else()
+    find_package(Boost ${BOOST_VERSION} REQUIRED COMPONENTS
+        coroutine
+    )
+endif()
 
 #
-# Detect platform & arch. We do not support cross-compilation 
-# so we assume that CMAKE_SYSTEM_NAME and CMAKE_HOST_SYSTEM_NAME are the same
-# as well as CMAKE_HOST_SYSTEM_PROCESSOR and CMAKE_SYSTEM_PROCESSOR
+# Detect platform & arch. For Linux / Windows / macOS host builds we do
+# not cross-compile, so CMAKE_SYSTEM_NAME == CMAKE_HOST_SYSTEM_NAME and
+# CMAKE_SYSTEM_PROCESSOR == CMAKE_HOST_SYSTEM_PROCESSOR. iOS is the one
+# exception: CMAKE_SYSTEM_NAME == "iOS" while the host stays on Darwin.
 #
 if ("${CMAKE_SYSTEM_NAME}" STREQUAL "Linux")
     set(LINUX TRUE)
-    
+
     if ("${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "x86_64")
         set(LINUX64 TRUE)
         set(X64 TRUE)
@@ -32,7 +60,7 @@ if ("${CMAKE_SYSTEM_NAME}" STREQUAL "Linux")
 
 elseif("${CMAKE_SYSTEM_NAME}" STREQUAL "Windows")
     set(WINDOWS TRUE)
-    
+
     if ("${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "AMD64")
         set(WIN64 TRUE)
         set(X64 TRUE)
@@ -49,6 +77,38 @@ elseif("${CMAKE_SYSTEM_NAME}" STREQUAL "Darwin")
         set(X64 TRUE)
     else()
          message(FATAL_ERROR "Unsupported host architecture ${CMAKE_SYSTEM_PROCESSOR}")
+    endif()
+elseif("${CMAKE_SYSTEM_NAME}" STREQUAL "iOS")
+    # Cross-compile from a macOS host to an iOS device or simulator.
+    # CMAKE_OSX_SYSROOT (iphoneos / iphonesimulator) determines the slice;
+    # CMAKE_OSX_ARCHITECTURES (arm64 or x86_64) picks the target arch.
+    set(IOS TRUE)
+
+    if (NOT "${CMAKE_HOST_SYSTEM_NAME}" STREQUAL "Darwin")
+        message(FATAL_ERROR "iOS cross-compilation requires a macOS host (got ${CMAKE_HOST_SYSTEM_NAME})")
+    endif()
+
+    if ("${CMAKE_OSX_SYSROOT}" MATCHES "iPhoneSimulator|iphonesimulator")
+        set(IOS_SIMULATOR TRUE)
+    else()
+        set(IOS_DEVICE TRUE)
+    endif()
+
+    list(LENGTH CMAKE_OSX_ARCHITECTURES _ios_arch_count)
+    if (_ios_arch_count GREATER 1)
+        message(FATAL_ERROR
+            "asio-ipfs iOS builds must target a single architecture per CMake "
+            "invocation (got: ${CMAKE_OSX_ARCHITECTURES}). Build each slice "
+            "separately and combine with xcodebuild -create-xcframework "
+            "(see scripts/build-ios.sh).")
+    endif()
+
+    if ("${CMAKE_OSX_ARCHITECTURES}" STREQUAL "arm64")
+        set(IOS_ARCH "arm64")
+    elseif ("${CMAKE_OSX_ARCHITECTURES}" STREQUAL "x86_64")
+        set(IOS_ARCH "x86_64")
+    else()
+        message(FATAL_ERROR "Unsupported iOS architecture '${CMAKE_OSX_ARCHITECTURES}' (expected arm64 or x86_64)")
     endif()
 else()
     message(FATAL_ERROR "Unsupported host platform ${CMAKE_SYSTEM_NAME}")
@@ -86,6 +146,28 @@ if (WIN64)
     set(GOSRC_HASH  "787c9afbcd7446874f79bffd20dc4219c3aeff6731bd03f09058bdd546c7eb87")
     set(GOOS        "windows")
     set(GOARCH      "amd64")
+endif()
+
+if (IOS)
+    # iOS builds are cross-compiled from a macOS host. Pick the Go binary
+    # matching the host arch, then set GOOS=ios / GOARCH for the target.
+    # Go 1.16 was the first release with stable GOOS=ios; older toolchains
+    # used GOOS=darwin with build tags. We download the host-matching
+    # Darwin tarball — Go's cross-compile is driven by env vars at build
+    # time, not by the toolchain download.
+    if ("${CMAKE_HOST_SYSTEM_PROCESSOR}" STREQUAL "arm64")
+        set(GOSRC       "https://dl.google.com/go/go1.16.10.darwin-arm64.tar.gz")
+        set(GOSRC_HASH  "850970c6b381b9a3e6da969bf1baddb8fe003ed90315082e5cb3afbbc87812d0")
+    else()
+        set(GOSRC       "https://dl.google.com/go/go1.16.10.darwin-amd64.tar.gz")
+        set(GOSRC_HASH  "895a3fe6d720297ce16272f41c198648da8675bb244ab6d60003265c176b6c48")
+    endif()
+    set(GOOS    "ios")
+    if ("${IOS_ARCH}" STREQUAL "arm64")
+        set(GOARCH "arm64")
+    else()
+        set(GOARCH "amd64")
+    endif()
 endif()
 
 externalproject_add(golang
@@ -251,6 +333,96 @@ elseif (DARWIN)
                     -o ${BINDINGS_LIBRARY}
                     ./src/ipfs_bindings
     )
+elseif (IOS)
+    set(BINDINGS_HEADER  "${BINDINGS_DIR}/libipfs-bindings.h")
+    set(BINDINGS_LIBRARY "${BINDINGS_DIR}/libipfs-bindings.a")
+    set(BINDINGS_OUTPUT  ${BINDINGS_HEADER} ${BINDINGS_LIBRARY})
+
+    # Pick the right Xcode SDK + clang `-target` triple for the slice we're
+    # building. Go's cgo treats CC as a single command string, so we pack
+    # the host clang path plus -isysroot / -target into one CC value and
+    # resolve it at configure time (xcrun is always available alongside
+    # Xcode, which is a hard prerequisite for any iOS build).
+    if (IOS_SIMULATOR)
+        set(IOS_SDK_NAME "iphonesimulator")
+        set(IOS_TARGET_SUFFIX "-simulator")
+    else()
+        set(IOS_SDK_NAME "iphoneos")
+        set(IOS_TARGET_SUFFIX "")
+    endif()
+
+    if (NOT IOS_DEPLOYMENT_TARGET)
+        if (CMAKE_OSX_DEPLOYMENT_TARGET)
+            set(IOS_DEPLOYMENT_TARGET "${CMAKE_OSX_DEPLOYMENT_TARGET}")
+        else()
+            set(IOS_DEPLOYMENT_TARGET "13.0")
+        endif()
+    endif()
+
+    set(IOS_CLANG_TARGET
+        "${IOS_ARCH}-apple-ios${IOS_DEPLOYMENT_TARGET}${IOS_TARGET_SUFFIX}")
+
+    execute_process(
+        COMMAND xcrun --sdk ${IOS_SDK_NAME} --show-sdk-path
+        OUTPUT_VARIABLE IOS_SDK_PATH
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE _xcrun_sdk_rc
+    )
+    execute_process(
+        COMMAND xcrun --sdk ${IOS_SDK_NAME} --find clang
+        OUTPUT_VARIABLE IOS_CLANG_BIN
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE _xcrun_clang_rc
+    )
+    if (NOT _xcrun_sdk_rc EQUAL 0 OR NOT _xcrun_clang_rc EQUAL 0
+            OR NOT IOS_SDK_PATH OR NOT IOS_CLANG_BIN)
+        message(FATAL_ERROR
+            "Could not locate Xcode SDK ${IOS_SDK_NAME} via xcrun. "
+            "Install Xcode and run xcode-select --install before configuring.")
+    endif()
+
+    # Go's cgo composes its own compile commands for std-library cgo glue
+    # (net, os/user, plugin, ...). When `CC` is a single string with embedded
+    # flags, Go only uses the first token as the program and silently drops
+    # the rest for those internal compiles, which is why CI hit fatal errors
+    # on `<unistd.h>`, `<netdb.h>`, `<dlfcn.h>` even though our CC carried
+    # `-isysroot`. CGO_CFLAGS / CGO_LDFLAGS are appended verbatim to every
+    # cgo invocation, so the iOS target + sysroot have to ride there.
+    set(IOS_CGO_FLAGS "-target ${IOS_CLANG_TARGET} -isysroot ${IOS_SDK_PATH}")
+
+    add_custom_command(
+        OUTPUT  ${BINDINGS_OUTPUT}
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/include/ipfs_error_codes.h
+                ${BINDINGS_SRC}
+                golang
+
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${BINDINGS_DIR}
+            && ${CMAKE_COMMAND} -E make_directory ${GOPATH_IPFS_DIR}
+            && ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/include ${GOPATH_IPFS_DIR}/include
+            && ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/src ${GOPATH_IPFS_DIR}/src
+            && ${CMAKE_COMMAND} -E copy ${CMAKE_CURRENT_SOURCE_DIR}/go.mod ${GOPATH_IPFS_DIR}
+            && ${CMAKE_COMMAND} -E copy ${CMAKE_CURRENT_SOURCE_DIR}/go.sum ${GOPATH_IPFS_DIR}
+
+        COMMAND ${CMAKE_COMMAND} -E chdir ${GOPATH_IPFS_DIR}
+                ${CMAKE_COMMAND} -E env
+                    "GOROOT=${GOROOT}"
+                    "GOPATH=${GOPATH}"
+                    "GOOS=${GOOS}"
+                    "GOARCH=${GOARCH}"
+                    "CGO_ENABLED=1"
+                    "GO111MODULE=on"
+                    "CC=${IOS_CLANG_BIN}"
+                    "CXX=${IOS_CLANG_BIN}"
+                    "CGO_CFLAGS=${IOS_CGO_FLAGS}"
+                    "CGO_CXXFLAGS=${IOS_CGO_FLAGS}"
+                    "CGO_LDFLAGS=${IOS_CGO_FLAGS}"
+                    ${GOROOT}/bin/go build
+                        --buildmode=c-archive
+                        -ldflags "-s -w"
+                        -modcacherw
+                        -o ${BINDINGS_LIBRARY}
+                        ./src/ipfs_bindings
+    )
 elseif(WIN64)
     set(BINDINGS_HEADER  "${BINDINGS_DIR}/ipfs-bindings.h")
     set(BINDINGS_LIBRARY "${BINDINGS_DIR}/ipfs-bindings.lib")
@@ -320,7 +492,7 @@ if (WINDOWS)
     # install(FILES ${BINDINGS_DLL} DESTINATION BIN)
 endif()
 
-if (LINUX OR DARWIN)
+if (LINUX OR DARWIN OR IOS)
     add_library(ipfs-bindings STATIC IMPORTED GLOBAL
         DEPENDS ipfs-bindings-build
     )
@@ -330,7 +502,9 @@ if (LINUX OR DARWIN)
     )
 endif()
 
-if (DARWIN)
+if (DARWIN OR IOS)
+    # go-ipfs links Apple system crypto + CFNetwork via its keychain bridge;
+    # bring those in for both macOS and iOS slices.
     target_link_libraries(ipfs-bindings
         INTERFACE
             "-framework CoreFoundation"
@@ -368,6 +542,18 @@ target_include_directories(asio-ipfs
 
 target_link_libraries(asio-ipfs
     PUBLIC ipfs-bindings
-    PUBLIC Boost::boost
-    INTERFACE ${Boost_LIBRARIES}
 )
+
+if (IOS)
+    # iOS callers supply Boost via BOOST_ROOT_IOS (headers only — Boost on
+    # iOS is typically a single combined framework). Drop the COMPONENTS
+    # link so the build doesn't require a separately-built boost_coroutine.
+    if (Boost_INCLUDE_DIR)
+        target_include_directories(asio-ipfs PUBLIC ${Boost_INCLUDE_DIR})
+    endif()
+else()
+    target_link_libraries(asio-ipfs
+        PUBLIC Boost::boost
+        INTERFACE ${Boost_LIBRARIES}
+    )
+endif()
